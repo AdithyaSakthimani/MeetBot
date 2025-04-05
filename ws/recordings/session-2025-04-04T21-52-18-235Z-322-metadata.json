@@ -1,0 +1,6 @@
+{
+  "sample_rate": 16000,
+  "channels": 1,
+  "format": "audio/pcm",
+  "client_type": "audio_streamer"
+}
