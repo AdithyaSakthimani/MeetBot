@@ -1,5 +1,4 @@
 import undetected_chromedriver as uc
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -8,268 +7,202 @@ import random
 import ssl
 import os
 import pyaudio
-import wave
 import threading
-import websocket
-import json
-import queue
-import base64
+from datetime import datetime
+from dotenv import load_dotenv
+import whisper
+import ffmpeg
+import websocket  # import the websocket client
 
 ssl._create_default_https_context = ssl._create_unverified_context
+WEBSOCKET_SERVER_URL = "ws://localhost:3000"
 
-class AudioStreamer:
-    def __init__(self, websocket_url):
+class AudioTranscriber:
+    def __init__(self):
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.recording = False
-        self.websocket_url = websocket_url
-        self.ws = None
-        self.audio_queue = queue.Queue()
-        self.connected = False
-        self.ws_lock = threading.Lock()
-        self.audio_sequence = 0
-        self.init_sent = False  # Track if init message was sent
-
-    def connect_websocket(self):
-        try:
-            # Disable trace for production (less noisy logs)
-            websocket.enableTrace(False)
-            
-            self.ws = websocket.WebSocketApp(
-                self.websocket_url,
-                on_open=self.on_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close
-            )
-            # Start WebSocket connection in a separate thread
-            threading.Thread(target=self.ws.run_forever, kwargs={'ping_interval': 30}, daemon=True).start()
-            print(f"Connecting to WebSocket server at {self.websocket_url}...")
-            
-            # Wait for the connection to be established
-            timeout = 15
-            start_time = time.time()
-            while not self.connected and time.time() - start_time < timeout:
-                time.sleep(0.1)
-            
-            if not self.connected:
-                print("Failed to connect to WebSocket server within timeout")
-                return False
-                
-            return True
-        except Exception as e:
-            print(f"WebSocket connection error: {e}")
-            return False
-
-    def on_open(self, ws):
-        print("WebSocket connection established")
-        self.connected = True
+        self.transcript_text = ""
         
-        # Send initial handshake message
-        init_message = {
-            "event": "init",
-            "client_type": "audio_streamer",
-            "format": "audio/pcm",
-            "sample_rate": 16000,
-            "channels": 1
-        }
-        with self.ws_lock:
-            # Important: Send as text, not binary
-            ws.send(json.dumps(init_message))
-            self.init_sent = True
-            print("Sent initialization message")
-            
-        # Wait a moment before sending audio data
-        time.sleep(0.5)
-            
-        # Start sender thread to handle the queue
-        threading.Thread(target=self.send_audio_data, daemon=True).start()
-
-    def on_message(self, ws, message):
+        # AWS credentials placeholder (not used here)
+        self.aws_access_key = os.getenv("AWS_ID")
+        self.aws_secret_key = os.getenv("AWS_SECRET")
+        self.aws_region = os.getenv("AWS_REGION", "us-east-1")
+        
+        self.SAMPLE_RATE = 16000
+        self.BYTES_PER_SAMPLE = 2
+        self.CHANNEL_NUMS = 1
+        
+        # Create output directory for recordings
+        self.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings')
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        
+        # Generate a session ID and set file paths for full recordings
+        self.session_id = f"session-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}-{random.randint(1000, 9999)}"
+        self.pcm_file_path = os.path.join(self.output_dir, f"{self.session_id}.pcm")
+        self.filestream = open(self.pcm_file_path, 'wb')
+        
+        # Load the Whisper model (using tiny.en for faster performance)
         try:
-            # Parse message as JSON if possible
-            msg_data = json.loads(message)
-            print(f"Received from server: {msg_data}")
-            
-            # Check for acknowledgment of init message
-            if msg_data.get('status') == 'connected':
-                print(f"Connection confirmed with session ID: {msg_data.get('sessionId')}")
-        except:
-            # Not JSON, print as is (truncated)
-            print(f"Received from server: {message[:100]}...")
+            print("Loading Whisper model (tiny.en)...")
+            self.whisper_model = whisper.load_model("tiny.en")
+        except Exception as e:
+            print(f"Error loading Whisper model: {e}")
+            self.whisper_model = None
 
-    def on_error(self, ws, error):
-        print(f"WebSocket error: {error}")
-        self.connected = False
+        # Create a WebSocket connection to the Node.js backend
+        try:
+            print(f"Connecting to WebSocket server at {WEBSOCKET_SERVER_URL} ...")
+            self.ws = websocket.create_connection(WEBSOCKET_SERVER_URL)
+            print("WebSocket connection established.")
+        except Exception as e:
+            print(f"Failed to connect to WebSocket server: {e}")
+            self.ws = None
 
-    def on_close(self, ws, close_status_code, close_msg):
-        print(f"WebSocket connection closed: {close_status_code} - {close_msg}")
-        self.connected = False
+    def _transcribe_chunk(self, chunk_data, index):
+        """
+        Save a PCM chunk to file, convert it to WAV, transcribe it using Whisper,
+        and send the transcription result over the WebSocket connection.
+        """
+        chunk_pcm_path = os.path.join(self.output_dir, f"{self.session_id}_chunk_{index}.pcm")
+        chunk_wav_path = chunk_pcm_path.replace(".pcm", ".wav")
+
+        # Save the PCM chunk
+        with open(chunk_pcm_path, 'wb') as f:
+            f.write(chunk_data)
+
+        # Convert PCM to WAV using ffmpeg
+        try:
+            ffmpeg.input(chunk_pcm_path, f='s16le', ac=1, ar=self.SAMPLE_RATE)\
+                  .output(chunk_wav_path).run(quiet=True, overwrite_output=True)
+        except Exception as e:
+            print(f"❌ Error converting chunk {index} to WAV: {e}")
+            return
+
+        # Transcribe with Whisper
+        if not self.whisper_model:
+            print("Whisper model not loaded; cannot transcribe chunk.")
+            return
+        try:
+            result = self.whisper_model.transcribe(chunk_wav_path)
+            transcript = result['text'].strip()
+            print(f"🗣 [Live] Chunk {index} Transcript:\n{transcript}\n")
+            self.transcript_text += transcript + " "
+            self._send_transcript(transcript, index)
+        except Exception as e:
+            print(f"❌ Error in Whisper transcription for chunk {index}: {e}")
+
+    def _send_transcript(self, transcript, chunk_index):
+        """
+        Send the transcription text for this chunk to the WebSocket server.
+        """
+        if self.ws:
+            payload = {
+                "session_id": self.session_id,
+                "chunk": chunk_index,
+                "transcript": transcript,
+                "timestamp": datetime.now().isoformat()
+            }
+            try:
+                self.ws.send(str(payload))
+            except Exception as e:
+                print(f"❌ Failed to send transcript over WebSocket: {e}")
+        else:
+            print("WebSocket connection not available.")
 
     def start_streaming(self):
-        if not self.connect_websocket():
-            print("Cannot start streaming - WebSocket connection failed")
-            return
-            
+        """Start audio streaming and live transcription."""
         self.recording = True
         
-        # Configure audio stream
         try:
-            # List available input devices first
             print("\nAvailable audio input devices:")
             for i in range(self.p.get_device_count()):
                 dev_info = self.p.get_device_info_by_index(i)
-                if dev_info['maxInputChannels'] > 0:  # if it has input channels
+                if dev_info['maxInputChannels'] > 0:
                     print(f"Device {i}: {dev_info['name']}")
                     
-            # Configure audio stream
             self.stream = self.p.open(
                 format=pyaudio.paInt16,
                 channels=1,
-                rate=16000,  # Using 16kHz which is common for speech recognition
+                rate=self.SAMPLE_RATE,
                 input=True,
                 frames_per_buffer=1024
             )
             
-            # Start recording thread
+            # Start the recording thread
             threading.Thread(target=self._record, daemon=True).start()
-            print("Audio streaming started")
+            print("Audio streaming and live transcription started")
             
         except Exception as e:
             print(f"Error setting up audio stream: {e}")
             self.recording = False
 
     def _record(self):
-        """Capture audio data and add to queue"""
-        data_captured = 0
-        zero_chunks = 0
-        total_chunks = 0
-        buffer_size = 4096  # Increased buffer size
-        
+        """Capture audio data in ~5-second chunks for live transcription."""
+        buffer = bytearray()
+        chunk_index = 0
+        start_time = time.time()
+
         while self.recording:
             try:
-                # Read larger chunks for efficiency
-                data = self.stream.read(buffer_size, exception_on_overflow=False)
-                total_chunks += 1
-                
-                # Check if this is silent/zero audio
-                is_silent = all(b == 0 for b in data[:100])  # Check first 100 bytes
-                if is_silent:
-                    zero_chunks += 1
-                
-                if not data or len(data) == 0:
-                    print("Warning: Empty audio chunk received")
-                    continue
-                    
-                data_captured += len(data)
-                
-                # Log audio statistics
-                if data_captured % 32000 == 0:  # Every 2 seconds
-                    print(f"Audio captured: {data_captured / 1024:.1f}KB (Silence: {zero_chunks}/{total_chunks} chunks)")
-                    
-                self.audio_queue.put(data)
+                data = self.stream.read(1024, exception_on_overflow=False)
+                buffer.extend(data)
+                self.filestream.write(data)
+
+                if time.time() - start_time >= 5:
+                    chunk_data = bytes(buffer)
+                    threading.Thread(
+                        target=self._transcribe_chunk,
+                        args=(chunk_data, chunk_index),
+                        daemon=True
+                    ).start()
+                    chunk_index += 1
+                    buffer.clear()
+                    start_time = time.time()
+
             except Exception as e:
-                print(f"Error reading audio: {e}")
+                print(f"❌ Error reading audio: {e}")
                 time.sleep(0.1)
 
-    def send_audio_data(self):
-        """Send audio data from queue to WebSocket server"""
-        data_sent = 0
-        last_log_time = time.time()
-        
-        # Wait until init message is confirmed sent
-        while not self.init_sent and self.recording:
-            time.sleep(0.1)
-        
-        # Small delay to ensure server processes init message
-        time.sleep(0.5)
-        
-        while self.recording or not self.audio_queue.empty():
-            if not self.connected:
-                print("WebSocket disconnected, cannot send audio")
-                time.sleep(1)
-                continue
-                
-            try:
-                if not self.audio_queue.empty():
-                    audio_chunk = self.audio_queue.get()
-                    data_sent += len(audio_chunk)
-                    
-                    # Log progress every second rather than every packet
-                    current_time = time.time()
-                    if current_time - last_log_time >= 1.0:
-                        print(f"Sending audio data: {data_sent / 1024:.1f}KB sent so far")
-                        last_log_time = current_time
-                    
-                    with self.ws_lock:
-                        if self.connected and self.ws and self.ws.sock:
-                            # Important: Create audio data packet with an event
-                            # This makes it explicit that we're sending binary audio data
-                            audio_packet = {
-                                "event": "audio_data",
-                                "sequence": self.audio_sequence,
-                                "format": "audio/pcm",
-                                "data": base64.b64encode(audio_chunk).decode('utf-8')
-                            }
-                            self.audio_sequence += 1
-                            
-                            # Send as text, not binary
-                            self.ws.send(json.dumps(audio_packet))
-                        else:
-                            print("WebSocket not available for sending")
-                            
-                else:
-                    time.sleep(0.01)  # Small delay when queue is empty
-            except websocket.WebSocketConnectionClosedException:
-                print("WebSocket connection closed while sending data")
-                break
-            except Exception as e:
-                print(f"Error sending audio data: {e}")
-                time.sleep(0.1)  # Wait before retry
-
     def stop_streaming(self):
-        print("Stopping audio streaming...")
+        """Stop streaming and clean up resources."""
+        print("Stopping audio streaming and transcription...")
         self.recording = False
-        
-        # Make sure audio queue is empty before closing
-        while not self.audio_queue.empty():
-            time.sleep(0.1)
+        time.sleep(1)
         
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
             self.stream = None
             print("Audio stream closed")
-            
-        # Close WebSocket connection gracefully
-        with self.ws_lock:
-            if self.ws and self.connected:
-                try:
-                    # Send a closing message
-                    close_msg = {"event": "stop", "message": "Streaming stopped"}
-                    self.ws.send(json.dumps(close_msg))
-                    print("Sent stop message to server")
-                    time.sleep(1.0)  # Give server more time to process
-                    self.ws.close()
-                    print("WebSocket closed")
-                except Exception as e:
-                    print(f"Error closing WebSocket: {e}")
-        
-        # Clean up PyAudio
+
+        if self.filestream:
+            self.filestream.close()
+            print(f"PCM recording saved to {self.pcm_file_path}")
+
         if self.p:
             self.p.terminate()
             print("PyAudio terminated")
+        
+        if self.ws:
+            try:
+                self.ws.close()
+                print("WebSocket connection closed.")
+            except Exception as e:
+                print(f"❌ Error closing WebSocket connection: {e}")
+
+        print("Final transcript:")
+        print(self.transcript_text)
 
 def human_delay(min_time=2, max_time=5):
     time.sleep(random.uniform(min_time, max_time))
 
-def join_and_stream_meet(meet_link, websocket_url):
-    # Create audio streamer
-    audio_streamer = AudioStreamer(websocket_url)
-
-    # Use undetected_chromedriver's native ChromeOptions
-    chrome_options = uc.ChromeOptions()
+def join_and_stream_meet(meet_link):
+    audio_transcriber = AudioTranscriber()
+    audio_transcriber.start_streaming()
     
+    chrome_options = uc.ChromeOptions()
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--use-fake-ui-for-media-stream")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -277,96 +210,74 @@ def join_and_stream_meet(meet_link, websocket_url):
     chrome_options.add_argument("--disable-notifications")
 
     driver = None  
-    
     try:
         driver = uc.Chrome(options=chrome_options, version_main=134)
-        
         driver.get(meet_link)
         human_delay(5, 10)
 
-        try:
-            name_inputs = [
-                '//input[@aria-label="Your name"]',
-                '//input[@placeholder="Enter your name"]',
-                '//input[contains(@class, "name-input")]'
-            ]
-            
-            name_input = None
-            for xpath in name_inputs:
-                try:
-                    name_input = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, xpath))
-                    )
-                    if name_input:
-                        break
-                except:
-                    continue
-            
-            if name_input:
-                guest_name = "Guest" + str(random.randint(100, 999))
-                name_input.clear()
-                name_input.send_keys(guest_name)
-                human_delay(2, 4)
-                print(f"Name entered: {guest_name}")
-            else:
-                print("⚠ Could not find name input field")
-        except Exception as name_error:
-            print(f"Name input error: {name_error}")
-
-        # Join button handling
-        try:
-            join_buttons = [
-                "//span[contains(text(), 'Ask to join')]",
-                "//span[contains(text(), 'Join')]",
-                "//button[contains(@aria-label, 'Join')]",
-                "//div[contains(text(), 'Ask to join')]"
-            ]
-            
-            join_btn = None
-            for button_xpath in join_buttons:
-                try:
-                    join_btn = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, button_xpath))
-                    )
-                    if join_btn:
-                        join_btn.click()
-                        break
-                except:
-                    continue
-            
-            if join_btn:
-                human_delay(4, 7)
-                print("✅ Joined the Google Meet")
-                
-                # Start audio streaming
-                audio_streamer.start_streaming()
-                
-                try:
-                    # Keep the connection alive
-                    print("\nStreaming audio from Google Meet...\nPress Enter to stop streaming and exit...")
-                    input()
-                except KeyboardInterrupt:
-                    print("\nKeyboard interrupt detected, stopping...")
-                
-            else:
-                print("⚠ Could not find a join button")
+        name_inputs = [
+            '//input[@aria-label="Your name"]',
+            '//input[@placeholder="Enter your name"]',
+            '//input[contains(@class, "name-input")]'
+        ]
+        name_input = None
+        for xpath in name_inputs:
+            try:
+                name_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, xpath))
+                )
+                if name_input:
+                    break
+            except:
+                continue
         
-        except Exception as join_error:
-            print(f"Join button error: {join_error}")
-
+        if name_input:
+            guest_name = "Guest" + str(random.randint(100, 999))
+            name_input.clear()
+            name_input.send_keys(guest_name)
+            human_delay(2, 4)
+            print(f"Name entered: {guest_name}")
+        else:
+            print("⚠ Could not find name input field")
+        
+        join_buttons = [
+            "//span[contains(text(), 'Ask to join')]",
+            "//span[contains(text(), 'Join')]",
+            "//button[contains(@aria-label, 'Join')]",
+            "//div[contains(text(), 'Ask to join')]"
+        ]
+        join_btn = None
+        for button_xpath in join_buttons:
+            try:
+                join_btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, button_xpath))
+                )
+                if join_btn:
+                    join_btn.click()
+                    break
+            except:
+                continue
+        
+        if join_btn:
+            human_delay(4, 7)
+            print("✅ Joined the Google Meet")
+            try:
+                print("\nStreaming audio from Google Meet...\nPress Enter to stop streaming and exit...")
+                input()
+            except KeyboardInterrupt:
+                print("\nKeyboard interrupt detected, stopping...")
+        else:
+            print("⚠ Could not find a join button")
+    
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
     
     finally:
-        # Make sure to stop streaming before closing
-        if audio_streamer:
-            audio_streamer.stop_streaming()
-            
+        if audio_transcriber:
+            audio_transcriber.stop_streaming()       
         if driver:
             driver.quit()
 
 if __name__ == "__main__":
-    MEET_LINK = "https://meet.google.com/aqu-zbuo-qyn"
-    WEBSOCKET_URL = "ws://localhost:8080/audio"  # Replace with your teammate's WebSocket server URL
-    
-    join_and_stream_meet(MEET_LINK, WEBSOCKET_URL)
+    MEET_LINK = "https://meet.google.com/owt-ubst-scr"
+    join_and_stream_meet(MEET_LINK)
