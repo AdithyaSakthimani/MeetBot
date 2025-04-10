@@ -12,7 +12,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import whisper
 import ffmpeg
-import websocket  # import the websocket client
+import websocket
+import torch
+from pyannote.audio import Pipeline  # Import pyannote for diarization
+load_dotenv()
 
 ssl._create_default_https_context = ssl._create_unverified_context
 WEBSOCKET_SERVER_URL = "ws://localhost:3000"
@@ -23,6 +26,7 @@ class AudioTranscriber:
         self.stream = None
         self.recording = False
         self.transcript_text = ""
+        self.chunk_duration = 2  # seconds
         
         # AWS credentials placeholder (not used here)
         self.aws_access_key = os.getenv("AWS_ID")
@@ -50,6 +54,25 @@ class AudioTranscriber:
         except Exception as e:
             print(f"Error loading Whisper model: {e}")
             self.whisper_model = None
+            
+        # Load the diarization pipeline
+        try:
+            print("Loading speaker diarization model...")
+            # You'll need to get an auth token from HuggingFace
+            # and set it as HF_TOKEN in your environment
+            hf_token = os.getenv("HF_TOKEN")
+            print(f"Token found: {'Yes' if hf_token else 'No'}")
+
+            self.diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+            # Set this to run on GPU if available
+            if torch.cuda.is_available():
+                self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
+        except Exception as e:
+            print(f"Error loading diarization model: {e}")
+            self.diarization_pipeline = None
 
         # Create a WebSocket connection to the Node.js backend
         try:
@@ -60,10 +83,10 @@ class AudioTranscriber:
             print(f"Failed to connect to WebSocket server: {e}")
             self.ws = None
 
-    def _transcribe_chunk(self, chunk_data, index):
+    def _transcribe_and_diarize_chunk(self, chunk_data, index):
         """
-        Save a PCM chunk to file, convert it to WAV, transcribe it using Whisper,
-        and send the transcription result over the WebSocket connection.
+        Save a PCM chunk to file, convert it to WAV, transcribe and diarize it,
+        and send the results over the WebSocket connection.
         """
         chunk_pcm_path = os.path.join(self.output_dir, f"{self.session_id}_chunk_{index}.pcm")
         chunk_wav_path = chunk_pcm_path.replace(".pcm", ".wav")
@@ -84,14 +107,76 @@ class AudioTranscriber:
         if not self.whisper_model:
             print("Whisper model not loaded; cannot transcribe chunk.")
             return
+            
         try:
+            # Get the transcript from Whisper
             result = self.whisper_model.transcribe(chunk_wav_path)
             transcript = result['text'].strip()
-            print(f"🗣 [Live] Chunk {index} Transcript:\n{transcript}\n")
-            self.transcript_text += transcript + " "
-            self._send_transcript(transcript, index)
+            
+            # Only perform diarization if there's actual transcript content
+            if transcript and self.diarization_pipeline:
+                diarization_results = self._perform_diarization(chunk_wav_path)
+                diarized_transcript = self._combine_transcript_with_diarization(transcript, diarization_results)
+                print(f"🗣 [Live] Chunk {index} Diarized Transcript:\n{diarized_transcript}\n")
+                self.transcript_text += diarized_transcript + " "
+                self._send_transcript(diarized_transcript, index)
+            else:
+                print(f"🗣 [Live] Chunk {index} Transcript (no diarization):\n{transcript}\n")
+                self.transcript_text += transcript + " "
+                self._send_transcript(transcript, index)
+                
         except Exception as e:
-            print(f"❌ Error in Whisper transcription for chunk {index}: {e}")
+            print(f"❌ Error in transcription/diarization for chunk {index}: {e}")
+
+    def _perform_diarization(self, audio_file):
+        """
+        Perform speaker diarization on the audio file.
+        Returns a list of (speaker, start, end) tuples.
+        """
+        try:
+            # Run diarization on the audio file
+            diarization = self.diarization_pipeline(audio_file)
+            
+            # Extract speaker segments
+            segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append({
+                    "speaker": f"Speaker {speaker.split('_')[-1]}",
+                    "start": turn.start,
+                    "end": turn.end
+                })
+            
+            return segments
+        except Exception as e:
+            print(f"❌ Error in diarization: {e}")
+            return []
+    
+    def _combine_transcript_with_diarization(self, transcript, diarization_segments):
+        """
+        A simple heuristic to combine transcript with speaker information.
+        This is a basic approach - in a production system, you would need
+        a more sophisticated alignment between transcript and speakers.
+        """
+        if not diarization_segments:
+            return transcript
+            
+        # Sort segments by start time
+        diarization_segments.sort(key=lambda x: x["start"])
+        
+        # For simplicity, just take the most dominant speaker in this chunk
+        if len(diarization_segments) > 0:
+            # Count speaker occurrences
+            speaker_times = {}
+            for segment in diarization_segments:
+                speaker = segment["speaker"]
+                duration = segment["end"] - segment["start"]
+                speaker_times[speaker] = speaker_times.get(speaker, 0) + duration
+            
+            # Find the speaker with the most time
+            dominant_speaker = max(speaker_times.items(), key=lambda x: x[1])[0]
+            return f"[{dominant_speaker}]: {transcript}"
+        
+        return transcript
 
     def _send_transcript(self, transcript, chunk_index):
         """
@@ -139,7 +224,7 @@ class AudioTranscriber:
             self.recording = False
 
     def _record(self):
-        """Capture audio data in ~5-second chunks for live transcription."""
+        """Capture audio data in chunks for live transcription and diarization."""
         buffer = bytearray()
         chunk_index = 0
         start_time = time.time()
@@ -150,10 +235,10 @@ class AudioTranscriber:
                 buffer.extend(data)
                 self.filestream.write(data)
 
-                if time.time() - start_time >= 5:
+                if time.time() - start_time >= self.chunk_duration:
                     chunk_data = bytes(buffer)
                     threading.Thread(
-                        target=self._transcribe_chunk,
+                        target=self._transcribe_and_diarize_chunk,
                         args=(chunk_data, chunk_index),
                         daemon=True
                     ).start()
@@ -180,6 +265,30 @@ class AudioTranscriber:
         if self.filestream:
             self.filestream.close()
             print(f"PCM recording saved to {self.pcm_file_path}")
+            
+            # Process the full recording for better diarization results
+            if self.diarization_pipeline and os.path.exists(self.pcm_file_path):
+                try:
+                    print("Performing full diarization on the complete recording...")
+                    full_wav_path = self.pcm_file_path.replace(".pcm", ".wav")
+                    
+                    # Convert full PCM to WAV
+                    ffmpeg.input(self.pcm_file_path, f='s16le', ac=1, ar=self.SAMPLE_RATE)\
+                          .output(full_wav_path).run(quiet=True, overwrite_output=True)
+                          
+                    # Process the full recording for a more accurate diarization
+                    diarization = self.diarization_pipeline(full_wav_path)
+                    
+                    # Save diarization results
+                    diarization_output = os.path.join(self.output_dir, f"{self.session_id}-diarization.txt")
+                    with open(diarization_output, "w") as f:
+                        for turn, _, speaker in diarization.itertracks(yield_label=True):
+                            f.write(f"[{turn.start:.2f} → {turn.end:.2f}] {speaker}\n")
+                    
+                    print(f"Full diarization saved to {diarization_output}")
+                    
+                except Exception as e:
+                    print(f"❌ Error in full recording diarization: {e}")
 
         if self.p:
             self.p.terminate()
@@ -202,6 +311,7 @@ def join_and_stream_meet(meet_link):
     audio_transcriber = AudioTranscriber()
     audio_transcriber.start_streaming()
     
+    # Rest of the function remains the same
     chrome_options = uc.ChromeOptions()
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--use-fake-ui-for-media-stream")
@@ -262,7 +372,7 @@ def join_and_stream_meet(meet_link):
             human_delay(4, 7)
             print("✅ Joined the Google Meet")
             try:
-                print("\nStreaming audio from Google Meet...\nPress Enter to stop streaming and exit...")
+                print("\nStreaming audio from Google Meet with speaker diarization...\nPress Enter to stop streaming and exit...")
                 input()
             except KeyboardInterrupt:
                 print("\nKeyboard interrupt detected, stopping...")
@@ -279,5 +389,5 @@ def join_and_stream_meet(meet_link):
             driver.quit()
 
 if __name__ == "__main__":
-    MEET_LINK = "https://meet.google.com/owt-ubst-scr"
+    MEET_LINK = "https://meet.google.com/ydi-dinq-htc"
     join_and_stream_meet(MEET_LINK)
