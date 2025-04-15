@@ -11,20 +11,22 @@ import websocket
 import ffmpeg
 import asyncio
 import requests
-from DiarizationFile import DiarizationHelper
+#from DiarizationFile import DiarizationHelper
+import torch
 load_dotenv()
 
 ssl._create_default_https_context = ssl._create_unverified_context
 WEBSOCKET_SERVER_URL = os.getenv("WEBSOCKET_SERVER_URL")
+AWS_EC2_URL = os.getenv("AWS_EC2_URL")
 
-class AudioTranscriber(DiarizationHelper):
+class AudioTranscriber():
     def __init__(self):
         self.p = pyaudio.PyAudio()
         super().__init__()
         self.stream = None
         self.recording = False
         self.transcript_text = ""
-        self.chunk_duration = 2  # seconds
+        self.chunk_duration = 4  # seconds
         self.SAMPLE_RATE = 16000
         self.BYTES_PER_SAMPLE = 2
         self.CHANNEL_NUMS = 1
@@ -39,13 +41,15 @@ class AudioTranscriber(DiarizationHelper):
         self.pcm_file_path = os.path.join(self.output_dir, f"{self.session_id}.pcm")
         self.filestream = open(self.pcm_file_path, 'wb')
         
-        # Load the Whisper model (using tiny.en for faster performance)
-        try:
-            print("Loading Whisper model (tiny.en)...")
-            self.whisper_model = whisper.load_model("tiny.en")
-        except Exception as e:
-            print(f"Error loading Whisper model: {e}")
-            self.whisper_model = None
+        # # Load the Whisper model (using tiny.en for faster performance)
+        # try:
+        #     print("Loading Whisper model (tiny.en)...")
+        #     self.whisper_model = whisper.load_model("small.en", device="cpu")
+        #     self.whisper_model = self.whisper_model.to(dtype=torch.float32)
+
+        # except Exception as e:
+        #     print(f"Error loading Whisper model: {e}")
+        #     self.whisper_model = None
             
         # Create a WebSocket connection to the Node.js backend
         try:
@@ -55,18 +59,18 @@ class AudioTranscriber(DiarizationHelper):
         except Exception as e:
             print(f"Failed to connect to WebSocket server: {e}")
             self.ws = None
-    def _get_action_item(self, text  ):
-        URL = os.getenv("ACTION_URL")
-        response = requests.post(URL,json={"transcription": text, "trigger" : "manual"})
-        return response.json()
-    def _send_transcription_s3(self,text):
-        URL = os.getenv("S3_URL")
-        try:
-            response = requests.post(URL,json={"text": text})
-            print("data sent successfully")
-            print(response)
-        except:
-            print("error cannot send data to s3")
+    # def _get_action_item(self, text  ):
+    #     URL = os.getenv("ACTION_URL")
+    #     response = requests.post(URL,json={"transcription": text, "trigger" : "manual"})
+    #     return response.json()
+    # def _send_transcription_s3(self,text):
+    #     URL = os.getenv("S3_URL")
+    #     try:
+    #         response = requests.post(URL,json={"text": text})
+    #         print("data sent successfully")
+    #         print(response)
+    #     except:
+    #         print("error cannot send data to s3")
     def _send_transcript(self, transcript, chunk_index):
         """
         Send the transcription text for this chunk to the WebSocket server.
@@ -80,15 +84,70 @@ class AudioTranscriber(DiarizationHelper):
             }
             try:
                 self.ws.send(str(payload))
-                actionText = self._get_action_item(transcript)
-                self._send_transcription_s3(transcript)
-                print("action Text is : ")
-                print(actionText)
+                print(f"Transcript for chunk {chunk_index} sent to WebSocket server")
             except Exception as e:
                 print(f"❌ Failed to send transcript over WebSocket: {e}")
         else:
             print("WebSocket connection not available.")
 
+    def _transcribe_and_diarize_chunk(self, chunk_data, chunk_index):
+        try:
+            temp_file = f"chunk_{chunk_index}.pcm"
+            wav_file = f"chunk_{chunk_index}.wav"
+
+            # Save audio chunk as PCM data
+            with open(temp_file, "wb") as f:
+                f.write(chunk_data)
+
+            # Convert PCM to WAV using correct ffmpeg parameter names
+            # 'ac' for audio channels and 'ar' for audio rate
+            ffmpeg.input(
+                temp_file, 
+                format='s16le',  # PCM format
+                ac=self.CHANNEL_NUMS,  # Use 'ac' instead of 'channels'
+                ar=self.SAMPLE_RATE    # Use 'ar' instead of 'rate'
+            ).output(wav_file).run(overwrite_output=True, quiet=True)  # Added 'quiet=True' to reduce output
+
+            # Send to cloud API
+            print(f"Sending chunk {chunk_index} to EC2 server for processing...")
+            files = {"file": open(wav_file, "rb")}
+            response = requests.post(f"{AWS_EC2_URL}/transcribe", files=files)
+            
+            if response.status_code == 200:
+                
+                result = response.json()
+                transcription = result.get("transcription", "")
+                
+                # Store transcript for final output
+                if transcription:
+                    self.transcript_text += " " + transcription
+                
+                # Send the transcript to your WebSocket
+                self._send_transcript(transcription, chunk_index)
+                
+                # Log diarization results if available
+                diarization = result.get("diarization", [])
+                if diarization:
+                    print("Diarization results:")
+                    for entry in diarization:
+                        print(entry)
+                
+                # Log action items if available
+                actions = result.get("actions", {})
+                if actions:
+                    print("Action items detected:")
+                    print(actions)
+            else:
+                print(f"Transcription failed: {response.text}")
+
+            # Clean up temporary files
+            os.remove(temp_file)
+            os.remove(wav_file)
+
+        except Exception as e:
+            import traceback
+            print(f"Error in remote transcription: {e}")
+            print(traceback.format_exc())  # Print the full traceback for better debugging
     def start_streaming(self):
         """Start audio streaming and live transcription."""
         self.recording = True
@@ -157,30 +216,9 @@ class AudioTranscriber(DiarizationHelper):
             self.filestream.close()
             print(f"PCM recording saved to {self.pcm_file_path}")
             
-            # Process the full recording for better diarization results
-            if self.diarization_pipeline and os.path.exists(self.pcm_file_path):
-                try:
-                    print("Performing full diarization on the complete recording...")
-                    full_wav_path = self.pcm_file_path.replace(".pcm", ".wav")
-                    
-                    # Convert full PCM to WAV
-                    ffmpeg.input(self.pcm_file_path, f='s16le', ac=1, ar=self.SAMPLE_RATE)\
-                          .output(full_wav_path).run(quiet=True, overwrite_output=True)
-                          
-                    # Process the full recording for a more accurate diarization
-                    diarization = self.diarization_pipeline(full_wav_path)
-                    
-                    # Save diarization results
-                    diarization_output = os.path.join(self.output_dir, f"{self.session_id}-diarization.txt")
-                    with open(diarization_output, "w") as f:
-                        for turn, _, speaker in diarization.itertracks(yield_label=True):
-                            f.write(f"[{turn.start:.2f} → {turn.end:.2f}] {speaker}\n")
-                    
-                    print(f"Full diarization saved to {diarization_output}")
-                    
-                except Exception as e:
-                    print(f"❌ Error in full recording diarization: {e}")
-
+            # You could send the full recording to the EC2 server for final processing if desired
+            # But that's optional
+        
         if self.p:
             self.p.terminate()
             print("PyAudio terminated")
@@ -194,4 +232,3 @@ class AudioTranscriber(DiarizationHelper):
 
         print("Final transcript:")
         print(self.transcript_text)
-    

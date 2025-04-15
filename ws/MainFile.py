@@ -91,5 +91,5 @@ def join_and_stream_meet(meet_link):
             driver.quit()
 
 if __name__ == "__main__":
-    MEET_LINK = "https://meet.google.com/ydi-dinq-htc"
+    MEET_LINK = "https://meet.google.com/zbk-gaoy-mmq"
     join_and_stream_meet(MEET_LINK)

@@ -2,6 +2,7 @@ import os
 from pyannote.audio import Pipeline 
 import ffmpeg
 import torch
+import requests
 class DiarizationHelper:
     def __init__(self):
         try:
@@ -61,52 +62,42 @@ class DiarizationHelper:
         except Exception as e:
             print(f"❌ Error in diarization: {e}")
             return []
-    def _transcribe_and_diarize_chunk(self, chunk_data, index):
-        """
-        Save a PCM chunk to file, convert it to WAV, transcribe and diarize it,
-        and send the results over the WebSocket connection.
-        """
-        chunk_pcm_path = os.path.join(self.output_dir, f"{self.session_id}_chunk_{index}.pcm")
-        chunk_wav_path = chunk_pcm_path.replace(".pcm", ".wav")
-
-        # Save the PCM chunk
-        with open(chunk_pcm_path, 'wb') as f:
-            f.write(chunk_data)
-
-        # Convert PCM to WAV using ffmpeg
+    def _transcribe_and_diarize_chunk(self, chunk_data, chunk_index):
         try:
-            ffmpeg.input(chunk_pcm_path, f='s16le', ac=1, ar=self.SAMPLE_RATE)\
-                  .output(chunk_wav_path).run(quiet=True, overwrite_output=True)
-        except Exception as e:
-            print(f"❌ Error converting chunk {index} to WAV: {e}")
-            return
+            temp_file = f"chunk_{chunk_index}.wav"
 
-        # Transcribe with Whisper
-        if not self.whisper_model:
-            print("Whisper model not loaded; cannot transcribe chunk.")
-            return
-            
-        try:
-            # Get the transcript from Whisper
-            result = self.whisper_model.transcribe(chunk_wav_path)
-            transcript = result['text'].strip()
-            # Only perform diarization if there's actual transcript content
-            if transcript and self.diarization_pipeline:
-                diarization_results = self._perform_diarization(chunk_wav_path)
-                diarized_transcript = self._combine_transcript_with_diarization(transcript, diarization_results)
-                print(f"🗣 [Live] Chunk {index} Diarized Transcript:\n{diarized_transcript}\n")
-                self.transcript_text += diarized_transcript + " "
-                self._send_transcript(diarized_transcript, index)
+            # Save audio chunk temporarily
+            with open(temp_file, "wb") as f:
+                f.write(chunk_data)
+
+            # Convert to WAV (if needed)
+            wav_file = temp_file.replace(".wav", "_converted.wav")
+            ffmpeg.input(temp_file).output(wav_file, ar=16000, ac=1).run(overwrite_output=True)
+
+            # Send to cloud API
+            files = {"file": open(wav_file, "rb")}
+            response = requests.post(f"{os.getenv('AWS_EC2_URL')}/transcribe", files=files)
+
+            if response.status_code == 200:
+                result = response.json()
+                transcription = result.get("transcription", "")
+                # Get diarization and actions from the response if available
+                diarization = result.get("diarization", [])
+                actions = result.get("actions", {})
+                
+                # Send the transcript to your WebSocket
+                self._send_transcript(transcription, chunk_index)
+                
+                # Print actions if available
+                if actions:
+                    print("Action items detected:")
+                    print(actions)
             else:
-                print(f"🗣 [Live] Chunk {index} Transcript (no diarization):\n{transcript}\n")
-                self.transcript_text += transcript + " "
-                self._send_transcript(transcript, index)
-            if os.path.exists(chunk_wav_path):
-                    os.remove(chunk_wav_path)
-            if os.path.exists(chunk_pcm_path):
-                    os.remove(chunk_pcm_path)
+                print(f"Transcription failed: {response.text}")
+
+            # Clean up temporary files
+            os.remove(temp_file)
+            os.remove(wav_file)
+
         except Exception as e:
-            print(f"❌ Error in transcription/diarization for chunk {index}: {e}")
-        
-
-
+            print(f"Error in remote transcription: {e}")
